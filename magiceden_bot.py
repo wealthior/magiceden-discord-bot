@@ -7,9 +7,11 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from discord import app_commands
 from discord.ext import commands
+from flask import Flask
+from threading import Thread
 
 load_dotenv()
-
+app = Flask(__name__)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 COLLECTIONS = os.getenv("COLLECTIONS").split(",")
@@ -23,6 +25,19 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 last_checked = {}
 uptime_start = datetime.now()
+
+
+@app.route("/")
+def home():
+    return "✅ Discord Bot is running!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+def keep_alive():
+    t = Thread(target=run_web)
+    t.start()
 
 # --- File-Handling ---
 def get_seen_file(collection):
@@ -227,4 +242,5 @@ async def help_command(interaction: discord.Interaction):
     """
     await interaction.response.send_message(help_text, ephemeral=True)
 
+keep_alive()
 client.run(DISCORD_TOKEN)
