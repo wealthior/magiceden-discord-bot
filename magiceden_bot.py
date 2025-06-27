@@ -1,217 +1,233 @@
 import os
 import asyncio
-import sqlite3
+import logging
+from datetime import datetime, timezone
+
 import discord
-import requests
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
+from discord.ext import commands, tasks
 from discord import app_commands
 
-# --- Load ENV ---
-load_dotenv()
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+import requests
+from flask import Flask
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# --- Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("discord-bot")
+
+try:
+    cred = credentials.Certificate("serviceAccountKey.json")
+    firebase_admin.initialize_app(cred)
+    logger.info("✅ Firebase initialized with serviceAccountKey.json (Local Mode).")
+except FileNotFoundError:
+    firebase_admin.initialize_app()
+    logger.info("✅ Firebase initialized without serviceAccountKey.json (Cloud Run Mode).")
+
+db = firestore.client()
+TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
-COLLECTIONS = os.getenv("COLLECTIONS", "").split(",")
-LIMIT = 100
-CHECK_INTERVAL = 60
-SEEN_EXPIRY_HOURS = 24
-
-# --- Discord Setup ---
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-last_checked = {}
-uptime_start = datetime.now()
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+app = Flask(__name__)
 
-# --- SQLite DB Setup ---
-conn = sqlite3.connect("seen.db")
-cur = conn.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS seen_listings (
-    collection TEXT,
-    mint TEXT,
-    price REAL,
-    timestamp TEXT,
-    PRIMARY KEY (collection, mint, price)
-)
-""")
-conn.commit()
+@app.route("/")
+def index(): return "✅ Magic Eden Discord Bot is active!"
 
-def was_seen(collection, mint, price):
-    cur.execute("""
-        SELECT timestamp FROM seen_listings
-        WHERE collection=? AND mint=? AND price=?
-    """, (collection, mint, price))
-    row = cur.fetchone()
-    if row:
-        ts = datetime.strptime(row[0], "%Y-%m-%dT%H:%M:%S")
-        if datetime.now() - ts < timedelta(hours=SEEN_EXPIRY_HOURS):
-            return True
-    return False
+# --- Firestore Helpers ---
+def get_collections_from_db():
+    doc = db.collection("bot_config").document("collections").get()
+    return doc.to_dict().get("symbols", []) if doc.exists else []
 
-def mark_seen(collection, mint, price):
-    cur.execute("""
-        INSERT OR REPLACE INTO seen_listings (collection, mint, price, timestamp)
-        VALUES (?, ?, ?, ?)
-    """, (collection, mint, price, datetime.now().strftime("%Y-%m-%dT%H:%M:%S")))
-    conn.commit()
+def get_last_seen_timestamp(symbol: str) -> int:
+    doc = db.collection("bot_state").document(symbol).get()
+    return doc.to_dict().get("last_seen_timestamp", int(datetime.now(timezone.utc).timestamp())) if doc.exists else int(datetime.now(timezone.utc).timestamp())
 
-def reset_seen(collection):
-    cur.execute("DELETE FROM seen_listings WHERE collection=?", (collection,))
-    conn.commit()
+def set_last_seen_timestamp(symbol: str, timestamp: int):
+    db.collection("bot_state").document(symbol).set({"last_seen_timestamp": timestamp})
 
-def count_seen(collection):
-    cur.execute("SELECT COUNT(*) FROM seen_listings WHERE collection=?", (collection,))
-    return cur.fetchone()[0]
+# --- API Calls ---
+def get_activities(symbol: str):
+    url = f"https://api-mainnet.magiceden.dev/v2/collections/{symbol}/activities?offset=0&limit=500"
+    try:
+        res = requests.get(url, timeout=30)
+        res.raise_for_status()
+        return res.json()
+    except requests.RequestException as e:
+        logger.error(f"[{symbol}] API Error during get_activities: {e}")
+    return []
 
-# --- API Call ---
-def fetch_listings(collection):
-    url = f"https://api-mainnet.magiceden.dev/v2/collections/{collection}/listings?offset=0&limit={LIMIT}"
-    res = requests.get(url)
-    res.raise_for_status()
-    return res.json()
+def get_token_metadata(mint: str):
+    url = f"https://api-mainnet.magiceden.dev/v2/tokens/{mint}"
+    try:
+        res = requests.get(url, timeout=20)
+        res.raise_for_status()
+        return res.json()
+    except requests.RequestException as e:
+        logger.error(f"[{mint}] API Error during get_token_metadata: {e}")
+    return {}
 
-# --- Discord Notify ---
-async def send_listing(nft, collection, channel):
-    token = nft["token"]
-    name = token.get("name", "Unnamed NFT")
-    price = nft["price"]
-    mint = token["mintAddress"]
-    image = token["image"]
-    seller = token.get("mintAuthority", "unknown wallet")
-    url = f"https://magiceden.io/item-details/{mint}"
-
+# --- Embed Generators ---
+def create_embed(title, color, activity, name, image_url):
+    """Base function to create a Discord embed."""
     embed = discord.Embed(
-        title=f"[{collection}] {name}",
-        description=f"💰 **Price:** {price} SOL\n👤 **Seller:** `{seller}`\n[🔗 View on Magic Eden]({url})",
-        color=0x00ffcc,
-        timestamp=datetime.now()
+        title=f"{title}: {name}",
+        color=color,
+        timestamp=datetime.fromtimestamp(activity.get("blockTime"), tz=timezone.utc)
     )
-    embed.set_thumbnail(url=image)
-    embed.set_footer(text="Magic Eden Monitor")
+    link = f"https://magiceden.io/item-details/{activity.get('tokenMint', '')}"
+    embed.add_field(name="Collection", value=activity.get("collection", "N/A"), inline=True)
+    embed.add_field(name="Seller", value=f"`{activity.get('seller')}`", inline=True)
+    embed.add_field(name="🔗 Link", value=f"[View on Magic Eden]({link})", inline=False)
+    if image_url:
+        embed.set_thumbnail(url=image_url)
+    embed.set_footer(text="Magic Eden Bot")
+    return embed
+
+async def send_new_listing_embed(channel, activity, metadata):
+    embed = create_embed("✅ New Listing", discord.Color.green(), activity, metadata.get("name", "Unknown Item"), metadata.get("image"))
+    embed.add_field(name="💰 Price", value=f"**{activity.get('price')} SOL**", inline=False)
     await channel.send(embed=embed)
 
-# --- Main Monitor Loop ---
-async def monitor_listings():
-    await client.wait_until_ready()
-    channel = client.get_channel(CHANNEL_ID)
+async def send_price_update_embed(channel, activity, metadata, old_price):
+    embed = create_embed("🔄 Price Update", discord.Color.blue(), activity, metadata.get("name", "Unknown Item"), metadata.get("image"))
+    embed.add_field(name="💸 Price Change", value=f"`{old_price}` SOL -> **{activity.get('price')} SOL**", inline=False)
+    await channel.send(embed=embed)
 
-    if channel is None:
-        print("❌ ERROR: Could not find Discord channel. Check permissions and channel ID.")
+# --- Core Logic ---
+async def process_collection(symbol: str):
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        logger.warning(f"[{symbol}] Channel {CHANNEL_ID} not found.")
         return
 
-    while not client.is_closed():
-        for collection in COLLECTIONS:
-            try:
-                listings = fetch_listings(collection)
-                now = datetime.now()
-                last_checked[collection] = now
+    last_timestamp = get_last_seen_timestamp(symbol)
+    activities = get_activities(symbol)
+    if not activities:
+        logger.info(f"[{symbol}] No activities found.")
+        return
+    
+    # Filter for relevant activities and sort them from oldest to newest
+    new_activities = [act for act in activities if act.get("blockTime") > last_timestamp]
+    new_activities.sort(key=lambda x: x['blockTime'])
 
-                for nft in listings:
-                    mint = nft["token"]["mintAddress"]
-                    price = nft["price"]
+    if not new_activities:
+        logger.info(f"[{symbol}] No new activities since timestamp {last_timestamp}.")
+        # Still update timestamp to keep moving forward
+        set_last_seen_timestamp(symbol, activities[0]['blockTime'])
+        return
 
-                    if not was_seen(collection, mint, price):
-                        await send_listing(nft, collection, channel)
-                        mark_seen(collection, mint, price)
+    logger.info(f"[{symbol}] Found {len(new_activities)} new activity/activities. Processing...")
 
-            except Exception as e:
-                print(f"[Error in {collection}] {e}")
+    for activity in new_activities:
+        activity_type = activity.get("type")
+        mint = activity.get("tokenMint")
+        if not mint:
+            continue
 
-        await asyncio.sleep(CHECK_INTERVAL)
+        listing_ref = db.collection(f"listings_{symbol}").document(mint)
 
-@client.event
+        if activity_type == "list":
+            listing_doc = listing_ref.get()
+            new_price = activity.get("price")
+
+            if not listing_doc.exists:
+                # --- Genuinely new listing ---
+                logger.info(f"[{symbol}] New listing for {mint} at {new_price} SOL.")
+                metadata = get_token_metadata(mint)
+                await send_new_listing_embed(channel, activity, metadata)
+                listing_ref.set({"price": new_price, "seller": activity.get("seller")})
+            else:
+                # --- Potentially a price update ---
+                old_price = listing_doc.to_dict().get("price")
+                if old_price != new_price:
+                    logger.info(f"[{symbol}] Price update for {mint}: {old_price} -> {new_price}.")
+                    metadata = get_token_metadata(mint)
+                    await send_price_update_embed(channel, activity, metadata, old_price)
+                    listing_ref.update({"price": new_price, "seller": activity.get("seller")})
+                else:
+                    logger.info(f"[{symbol}] Redundant list event for {mint}, ignoring.")
+        
+        elif activity_type == "delist":
+            logger.info(f"[{symbol}] Delist event for {mint}. Removing from state.")
+            listing_ref.delete()
+        
+        await asyncio.sleep(1) # Prevent rate limiting
+
+    # After processing all activities, update the timestamp to the latest one seen
+    latest_timestamp_in_batch = new_activities[-1]['blockTime']
+    set_last_seen_timestamp(symbol, latest_timestamp_in_batch)
+
+# --- Background Loop & Bot Events ---
+@tasks.loop(seconds=60)
+async def monitor_collections():
+    for symbol in get_collections_from_db():
+        try:
+            await process_collection(symbol)
+        except Exception as e:
+            logger.error(f"[ERROR in {symbol}] Unexpected error in loop: {e}", exc_info=True)
+
+@bot.event
 async def on_ready():
-    print(f"✅ Logged in as {client.user}")
+    logger.info(f"✅ Bot is logged in as {bot.user}")
     await tree.sync()
-    client.loop.create_task(monitor_listings())
+    monitor_collections.start()
 
-# --- Slash Commands ---
-@tree.command(name="status", description="Show bot and collection status")
-async def status_command(interaction: discord.Interaction):
-    lines = [f"✅ **Bot runs!**"]
-    for collection in COLLECTIONS:
-        ts = last_checked.get(collection)
-        ts_str = ts.strftime('%Y-%m-%d %H:%M:%S') if ts else "Never checked"
-        listings = count_seen(collection)
-        lines.append(f"📦 `{collection}` last checked: **{ts_str}** | Seen: `{listings}`")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+# --- Commands (keine Änderungen) ---
+@tree.command(name="status", description="Checks if the bot is online and operational.")
+async def status(interaction: discord.Interaction):
+    await interaction.response.send_message("✅ Bot is online and the monitoring loop is running.", ephemeral=True)
 
-@tree.command(name="collections", description="List all monitored collections")
-async def collections_command(interaction: discord.Interaction):
-    if not COLLECTIONS:
-        await interaction.response.send_message("❌ No collections currently monitored.", ephemeral=True)
+@tree.command(name="collections", description="Lists all currently monitored collections.")
+async def list_collections(interaction: discord.Interaction):
+    collections = get_collections_from_db()
+    msg = "No collections are currently being monitored."
+    if collections:
+        msg = "The following collections are being monitored:\n- " + "\n- ".join(collections)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@tree.command(name="addcollection", description="Adds a new collection to monitor.")
+@app_commands.describe(symbol="The collection symbol from Magic Eden (e.g., 'degods')")
+async def add_collection(interaction: discord.Interaction, symbol: str):
+    symbol = symbol.lower().strip()
+    doc_ref = db.collection("bot_config").document("collections")
+    doc = doc_ref.get()
+    collections = doc.to_dict().get("symbols", []) if doc.exists else []
+
+    if symbol in collections:
+        return await interaction.response.send_message(f"⚠️ `{symbol}` is already being monitored.", ephemeral=True)
+
+    collections.append(symbol)
+    doc_ref.set({"symbols": collections})
+    set_last_seen_timestamp(symbol, int(datetime.now(timezone.utc).timestamp()))
+    await interaction.response.send_message(f"✅ `{symbol}` has been added.", ephemeral=True)
+
+@tree.command(name="removecollection", description="Removes a collection from being monitored.")
+@app_commands.describe(symbol="The collection symbol from Magic Eden.")
+async def remove_collection(interaction: discord.Interaction, symbol: str):
+    symbol = symbol.lower().strip()
+    doc_ref = db.collection("bot_config").document("collections")
+    doc = doc_ref.get()
+    if not doc.exists:
+        return await interaction.response.send_message("⚠️ No collections are being tracked.", ephemeral=True)
+    
+    collections = doc.to_dict().get("symbols", [])
+    if symbol not in collections:
+        return await interaction.response.send_message(f"⚠️ `{symbol}` is not being monitored.", ephemeral=True)
+    
+    collections.remove(symbol)
+    doc_ref.set({"symbols": collections})
+    await interaction.response.send_message(f"❌ `{symbol}` will no longer be monitored.", ephemeral=True)
+
+# --- Run ---
+if __name__ == "__main__":
+    if not TOKEN:
+        logger.critical("DISCORD_TOKEN not found.")
     else:
-        await interaction.response.send_message(
-            f"📦 Currently monitored collections:\n- " + "\n- ".join(COLLECTIONS),
-            ephemeral=True
-        )
-
-@tree.command(name="seen", description="Show listing count for a collection")
-async def seen_command(interaction: discord.Interaction, collection: str):
-    try:
-        count = count_seen(collection)
-        await interaction.response.send_message(f"✅ `{collection}` tracks {count} listings.", ephemeral=True)
-    except:
-        await interaction.response.send_message(f"❌ Failed to get listings for `{collection}`.", ephemeral=True)
-
-@tree.command(name="uptime", description="Show bot uptime")
-async def uptime_command(interaction: discord.Interaction):
-    uptime = datetime.now() - uptime_start
-    await interaction.response.send_message(f"⏱ Bot uptime: {str(uptime).split('.')[0]}", ephemeral=True)
-
-@tree.command(name="latest", description="Show the latest listing for a collection")
-@app_commands.describe(collection="Collection slug (e.g. meatbags)")
-async def latest_command(interaction: discord.Interaction, collection: str):
-    try:
-        await interaction.response.defer(thinking=True)
-        listings = fetch_listings(collection)
-        if not listings:
-            await interaction.followup.send(f"❌ No listings found for `{collection}`.")
-            return
-        await send_listing(listings[0], collection, interaction.channel)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Could not fetch latest listing for `{collection}`.\nError: {e}")
-
-@tree.command(name="resetseen", description="Clear seen listing cache for a collection")
-async def reset_seen_command(interaction: discord.Interaction, collection: str):
-    try:
-        reset_seen(collection)
-        await interaction.response.send_message(f"🧹 Seen cache for `{collection}` cleared.", ephemeral=True)
-    except:
-        await interaction.response.send_message(f"❌ Failed to reset seen cache for `{collection}`.", ephemeral=True)
-
-@tree.command(name="addcollection", description="Add a collection to monitoring")
-async def add_collection(interaction: discord.Interaction, collection: str):
-    if collection in COLLECTIONS:
-        await interaction.response.send_message(f"ℹ️ `{collection}` is already monitored.", ephemeral=True)
-    else:
-        COLLECTIONS.append(collection)
-        await interaction.response.send_message(f"➕ Added `{collection}` to monitoring list.", ephemeral=True)
-
-@tree.command(name="removecollection", description="Remove a collection from monitoring")
-async def remove_collection(interaction: discord.Interaction, collection: str):
-    if collection not in COLLECTIONS:
-        await interaction.response.send_message(f"❌ `{collection}` is not being monitored.", ephemeral=True)
-    else:
-        COLLECTIONS.remove(collection)
-        await interaction.response.send_message(f"➖ Removed `{collection}` from monitoring list.", ephemeral=True)
-
-@tree.command(name="help", description="List all bot commands")
-async def help_command(interaction: discord.Interaction):
-    help_text = """
-📘 **Magic Eden Discord Bot Commands**
-
-/status - Show current bot and collection status  
-/collections - List all monitored collections  
-/addcollection <slug> - Add a new collection (non-persistent)  
-/removecollection <slug> - Remove a collection (non-persistent)  
-/seen <collection> - Show number of known listings  
-/latest <collection> - Show latest NFT listing  
-/resetseen <collection> - Clear known listings for collection  
-/uptime - Show how long the bot has been running  
-/help - Show this command list
-    """
-    await interaction.response.send_message(help_text, ephemeral=True)
-
-client.run(DISCORD_TOKEN)
+        async def main():
+            flask_task = asyncio.to_thread(app.run, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=False)
+            async with bot:
+                await asyncio.gather(flask_task, bot.start(TOKEN))
+        asyncio.run(main())

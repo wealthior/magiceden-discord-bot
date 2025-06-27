@@ -1,4 +1,7 @@
 discord.py==2.3.2
 python-dotenv
 requests
+google-cloud-firestore
+firebase-admin
 flask
+aiohttp

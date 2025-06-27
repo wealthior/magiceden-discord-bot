@@ -8,4 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 8080
 
+ENV PYTHONUNBUFFERED True
+
 CMD ["python", "magiceden_bot.py"]
