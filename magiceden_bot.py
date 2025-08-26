@@ -32,6 +32,11 @@ db = firestore.client()
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 
+# --- Cooldown configuration for price updates (in seconds) ---
+# Prevents spam from bots that update prices too frequently.
+# 900 seconds = 15 minutes. Set to 0 to disable.
+PRICE_UPDATE_COOLDOWN_SECONDS = 900
+
 # Define intents, what the bot is allowed to receive from Discord
 intents = discord.Intents.default()
 intents.dm_messages = True  # Required to send direct messages (DMs) for alerts
@@ -114,63 +119,96 @@ def create_embed(title, color, activity, name, image_url):
     embed.set_footer(text="Magic Eden Bot")
     return embed
 
+# --- Optimized: Prefer image from activity data to avoid extra API call ---
 async def send_new_listing_embed(channel, activity, metadata):
     """Sends a message for a new listing."""
-    embed = create_embed("✅ New Listing", discord.Color.green(), activity, metadata.get("name", "Unknown"), metadata.get("image"))
+    name = metadata.get("name", "Unknown")
+    image_url = activity.get("image") or metadata.get("image")
+    embed = create_embed("✅ New Listing", discord.Color.green(), activity, name, image_url)
     embed.add_field(name="💰 Price", value=f"**{activity.get('price')} SOL**", inline=False)
     await channel.send(embed=embed)
 
+# --- Optimized: Prefer image from activity data to avoid extra API call ---
 async def send_price_update_embed(channel, activity, metadata, old_price):
     """Sends a message for a price update."""
-    embed = create_embed("🔄 Price Update", discord.Color.blue(), activity, metadata.get("name", "Unknown"), metadata.get("image"))
+    name = metadata.get("name", "Unknown")
+    image_url = activity.get("image") or metadata.get("image")
+    embed = create_embed("🔄 Price Update", discord.Color.blue(), activity, name, image_url)
     embed.add_field(name="💸 Price Change", value=f"`{old_price}` SOL -> **{activity.get('price')} SOL**", inline=False)
     await channel.send(embed=embed)
 
-# --- Core Bot Logic ---
+
+# --- Core Bot Logic (UPDATED with Cooldown) ---
 async def process_collection_listings(session, symbol: str):
-    """Processes listing, delisting, and price update activities."""
+    """Processes listing, delisting, and price update activities with a cooldown."""
     channel = bot.get_channel(CHANNEL_ID)
     if not channel: return
 
     last_timestamp = get_last_seen_timestamp(symbol)
     activities = await get_activities(session, symbol)
-    if not activities: return
+    if not activities:
+        logger.info(f"[{symbol}] No activities returned from API.")
+        return
     
     new_activities = [act for act in activities if act.get("blockTime", 0) > last_timestamp]
-    new_activities.sort(key=lambda x: x.get('blockTime', 0))
-
+    
     if not new_activities:
-        if activities: set_last_seen_timestamp(symbol, activities[0]['blockTime'])
+        logger.info(f"[{symbol}] No new activities since timestamp {last_timestamp}.")
         return
 
+    new_activities.sort(key=lambda x: x.get('blockTime', 0))
     logger.info(f"[{symbol}] Found {len(new_activities)} new activity/activities. Processing...")
+
     for activity in new_activities:
         activity_type = activity.get("type")
         mint = activity.get("tokenMint")
         if not mint: continue
         
         listing_ref = db.collection(f"listings_{symbol}").document(mint)
+        activity_timestamp = activity.get("blockTime")
 
         if activity_type == "list":
             listing_doc = listing_ref.get()
             new_price = activity.get("price")
-            metadata = await get_token_metadata(session, mint) or {}
             
+            # This data will be saved to Firestore for the specific NFT
+            update_payload = {
+                "price": new_price, 
+                "seller": activity.get("seller"),
+                "last_update_timestamp": activity_timestamp
+            }
+
             if not listing_doc.exists:
+                # This is a brand new listing for an NFT we haven't seen before.
+                metadata = await get_token_metadata(session, mint) or {}
                 await send_new_listing_embed(channel, activity, metadata)
-                listing_ref.set({"price": new_price, "seller": activity.get("seller")})
+                listing_ref.set(update_payload)
             else:
-                old_price = listing_doc.to_dict().get("price")
+                # We have seen this NFT before, it's a price update or relist.
+                old_data = listing_doc.to_dict()
+                old_price = old_data.get("price")
+                last_update_time = old_data.get("last_update_timestamp", 0)
+
+                # COOLDOWN CHECK: Skip notification if the update is too frequent
+                if activity_timestamp - last_update_time < PRICE_UPDATE_COOLDOWN_SECONDS:
+                    logger.info(f"[{symbol}] Skipping frequent price update for mint {mint}.")
+                    listing_ref.update(update_payload) # Update DB to keep price current
+                    continue # Move to the next activity without sending a notification
+
                 if old_price != new_price:
+                    metadata = await get_token_metadata(session, mint) or {}
                     await send_price_update_embed(channel, activity, metadata, old_price)
-                    listing_ref.update({"price": new_price, "seller": activity.get("seller")})
+                    listing_ref.update(update_payload)
         
         elif activity_type == "delist":
             listing_ref.delete()
         
-        await asyncio.sleep(1)  # Brief pause to avoid hitting Discord/API rate limits
+        await asyncio.sleep(1)
     
-    set_last_seen_timestamp(symbol, new_activities[-1]['blockTime'])
+    # IMPORTANT: Only update the overall collection timestamp after processing all new activities
+    newest_processed_timestamp = new_activities[-1]['blockTime']
+    set_last_seen_timestamp(symbol, newest_processed_timestamp)
+    logger.info(f"[{symbol}] Collection timestamp updated to {newest_processed_timestamp}.")
 
 async def check_price_alerts(session):
     """Checks if any user-defined price alerts have been triggered."""
@@ -212,17 +250,28 @@ async def check_price_alerts(session):
             current_alerts.pop(index)
             doc_ref.set({"alerts": current_alerts})
 
-# --- Background Task ---
+# --- Background Task (UPDATED for better reliability) ---
 @tasks.loop(minutes=2)
 async def monitor_loop():
     """Main loop that regularly executes both core functions."""
     async with aiohttp.ClientSession() as session:
         logger.info("Starting monitoring run...")
-        # 1. Check listings
-        await asyncio.gather(*(process_collection_listings(session, symbol) for symbol in get_collections_from_db()))
-        # 2. Check price alerts
-        await check_price_alerts(session)
+        
+        # 1. Check listings. Use a for-loop with error handling to avoid a single failure stopping all checks.
+        for symbol in get_collections_from_db():
+            try:
+                await process_collection_listings(session, symbol)
+            except Exception as e:
+                logger.error(f"[ERROR in Listing-Check for {symbol}]: {e}", exc_info=True)
+
+        # 2. Check price alerts. Also add error handling for robustness.
+        try:
+            await check_price_alerts(session)
+        except Exception as e:
+            logger.error(f"[ERROR in Alert-Check]: {e}", exc_info=True)
+
         logger.info("Monitoring run finished.")
+
 
 # --- Bot Events ---
 @bot.event
@@ -364,7 +413,12 @@ async def alert_remove(interaction: discord.Interaction):
 
     async def select_callback(callback_interaction: discord.Interaction):
         chosen_index = int(select.values[0])
-        current_alerts = doc_ref.get().to_dict().get("alerts", [])
+        # Refetch alerts to ensure data is current before modifying
+        current_alerts_doc = doc_ref.get()
+        if not current_alerts_doc.exists:
+            return await callback_interaction.response.edit_message(content="Error: Could not find your alerts.", view=None)
+        
+        current_alerts = current_alerts_doc.to_dict().get("alerts", [])
         if chosen_index < len(current_alerts):
             removed_alert = current_alerts.pop(chosen_index)
             doc_ref.set({"alerts": current_alerts})
